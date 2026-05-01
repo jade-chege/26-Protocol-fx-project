@@ -1,0 +1,15 @@
+# Temporary Word Files
+~$*.docx
+~WRL*.tmp
+
+# Jupyter & Python Junk
+.ipynb_checkpoints/
+__pycache__/
+
+# Raw Data & Daily Outputs
+cot_data/
+Semi_automation/cot_data/
+session_state_*.json
+rate_diffs_*.json
+Semi_automation/session_state_*.json
+Semi_automation/rate_diffs_*.json
