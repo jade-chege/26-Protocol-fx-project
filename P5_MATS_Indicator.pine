@@ -89,8 +89,8 @@ if i_instType == "Indices"
     d_bearish := d_close < d_sma200 and h1_adx > 30
 
 // 2. FourH Setup
-h4_bullish = (h4_ema9 > h4_ema21) and (h4_ema21 > h4_ema50) and (h4_close > h4_ema50) and (h4_ema50 > h4_ema50[1])
-h4_bearish = (h4_ema9 < h4_ema21) and (h4_ema21 < h4_ema50) and (h4_close < h4_ema50) and (h4_ema50 < h4_ema50[1])
+h4_bullish = (h4_ema9 > h4_ema21) and (h4_ema21 > h4_ema50) and (h4_close > h4_ema50) and (h4_ema50 >= h4_ema50[1])
+h4_bearish = (h4_ema9 < h4_ema21) and (h4_ema21 < h4_ema50) and (h4_close < h4_ema50) and (h4_ema50 <= h4_ema50[1])
 
 // 3. Multi-Timeframe Agreement
 mtf_bull = d_bullish and h4_bullish
