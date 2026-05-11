@@ -1,57 +1,43 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import pytz
 import math
 
-class P3Backtester:
+class P3H1Funnel:
     def __init__(self, tickers=None):
         if tickers is None:
             self.tickers = ["EURUSD=X", "GBPUSD=X", "GC=F", "NQ=F"]
         else:
             self.tickers = tickers
 
-        # Standard Pip/Tick Mapping for absolute buffers
         self.PIP_MAP = {
             'EURUSD=X': 0.0001,
             'GBPUSD=X': 0.0001,
-            'GC=F': 0.1,  # 1 tick = 10 cents
-            'NQ=F': 0.25  # NQ min tick is 0.25
+            'GC=F': 0.1,
+            'NQ=F': 0.25
         }
 
-    def fetch_data(self, ticker, period="730d", interval="4h"):
-        """Fetches data using yfinance and converts timezone to Europe/London."""
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-
-        # yf sometimes returns multi-index columns depending on the version
+    def fetch_data(self, ticker):
+        df = yf.download(ticker, period="730d", interval="1h", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
-
         if df.empty:
             return df
 
-        # Timezone conversion
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC')
-        df.index = df.index.tz_convert('Europe/London')
-
+        else:
+            df.index = df.index.tz_convert('UTC')
         return df
 
     def calculate_indicators(self, df):
-        """Calculates required technical indicators."""
         df = df.copy()
-
-        # EMA200
         df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-        # Wilder's Smoothing for ATR and RSI
         def wilder_smooth(s, window):
-            """Wilder's Smoothing (Exponential Moving Average logic matching MT5/TradingView)."""
             alpha = 1.0 / window
             return s.ewm(alpha=alpha, adjust=False).mean()
 
-        # ATR (14)
         high_low = df['High'] - df['Low']
         high_close = np.abs(df['High'] - df['Close'].shift())
         low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -60,10 +46,6 @@ class P3Backtester:
         df['TR'] = true_range
         df['ATR14'] = wilder_smooth(true_range, 14)
 
-        # Average volume for 20 periods
-        df['AvgVol20'] = df['Volume'].rolling(window=20).mean()
-
-        # RSI (14) using Wilder's Smoothing
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0))
         loss = (-delta.where(delta < 0, 0))
@@ -71,84 +53,69 @@ class P3Backtester:
         avg_loss = wilder_smooth(loss, 14)
         rs = avg_gain / avg_loss
         df['RSI14'] = 100 - (100 / (1 + rs))
-        df['RSI14'] = df['RSI14'].fillna(50)  # default for early periods
+        df['RSI14'] = df['RSI14'].fillna(50)
 
-        # ADX (14)
-        up_move = df['High'] - df['High'].shift(1)
-        down_move = df['Low'].shift(1) - df['Low']
-
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-
-        plus_dm_series = pd.Series(plus_dm, index=df.index)
-        minus_dm_series = pd.Series(minus_dm, index=df.index)
-
-        smoothed_plus_dm = wilder_smooth(plus_dm_series, 14)
-        smoothed_minus_dm = wilder_smooth(minus_dm_series, 14)
-
-        plus_di = 100 * (smoothed_plus_dm / df['ATR14'])
-        minus_di = 100 * (smoothed_minus_dm / df['ATR14'])
-
-        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-        df['ADX14'] = wilder_smooth(dx.fillna(0), 14)
+        df['AvgVol20'] = df['Volume'].rolling(window=20).mean()
 
         return df
 
     def dual_regime_rsi(self, rsi, is_bullish, price, ema):
-        """Dual-Regime RSI Filter Logic"""
-        # If price > EMA200, it's an uptrend pullback (RSI < 50 threshold for bullish)
-        # If price < EMA200, it's a downtrend reversal (RSI < 35 threshold for bullish)
         if is_bullish:
-            if price > ema:
-                return rsi < 50
-            else:
-                return rsi < 35
+            if price > ema: return rsi < 50
+            else: return rsi < 35
         else:
-            if price < ema:
-                return rsi > 50
+            if price < ema: return rsi > 50
+            else: return rsi > 65
+
+    def evaluate_market_trade(self, bars, signal, entry, sl, tp1, tp2):
+        tp1_hit = False
+        original_risk = abs(entry - sl)
+        if original_risk == 0: return 0.0
+
+        for _, bar in bars.iterrows():
+            high, low, close = bar['High'], bar['Low'], bar['Close']
+
+            if signal == 'Bullish':
+                if low <= sl: return -1.0 if not tp1_hit else 0.75
+                if high >= tp1 and not tp1_hit:
+                    tp1_hit = True
+                    sl = entry
+                if high >= tp2 and tp1_hit: return 2.25
             else:
-                return rsi > 65
+                if high >= sl: return -1.0 if not tp1_hit else 0.75
+                if low <= tp1 and not tp1_hit:
+                    tp1_hit = True
+                    sl = entry
+                if low <= tp2 and tp1_hit: return 2.25
 
-    def detect_patterns(self, df, tracking_data):
-        """Detects candlestick patterns and filters them against the protocol conditions."""
-        df = df.copy()
+        final_close = bars.iloc[-1]['Close']
+        if signal == 'Bullish': floating_r = (final_close - entry) / original_risk
+        else: floating_r = (entry - final_close) / original_risk
 
-        # Output columns
-        df['Signal'] = None
-        df['Pattern'] = None
-        df['Confirmed'] = False
+        if tp1_hit: return 0.75 + (0.5 * floating_r)
+        else: return floating_r
 
-        # Iterate over the dataframe to find patterns
-        # We need at least 1 previous bar for engulfing and prior trend context
-        # We also evaluate the current forming/last candle without confirmation
-        for i in range(1, len(df)):
+    def run_funnel(self, ticker, df):
+        pip_inc = self.PIP_MAP.get(ticker, 0.0001)
+        trades_A = []
+        trades_B = []
+        trades_C = []
+
+        for i in range(1, len(df) - 15):
             current = df.iloc[i]
             prev = df.iloc[i - 1]
-
-            # For confirmation we check if there's a next bar, else it's unconfirmed
-            if i + 1 < len(df):
-                next_bar = df.iloc[i + 1]
-            else:
-                next_bar = None
+            c_plus_1 = df.iloc[i + 1]
 
             body_size = abs(current['Close'] - current['Open'])
             wick_upper = current['High'] - max(current['Close'], current['Open'])
             wick_lower = min(current['Close'], current['Open']) - current['Low']
 
-            # Universal Filter Values
             rsi = current['RSI14']
             ema = current['EMA200']
             atr = current['ATR14']
-            range_len = current['High'] - current['Low']
-            # Based on 4H interval boundary checks, times might be e.g. 12, 16, etc.
-            # London 08:00 - 16:00, NY 13:00 - 21:00
-            # 13:00-16:00 means hour can be anywhere >=8 and <=20 depending on overlapping interval
-            # We'll allow the entire London & NY sessions for the scanner (8 to 20)
-            is_valid_session = 8 <= current.name.hour <= 20
+            vol = current['Volume']
+            avg_vol = current['AvgVol20']
 
-            # Filter 1 & 4 Context Logic
-
-            # Track raw patterns
             is_hammer = (wick_lower >= 2 * body_size) and (wick_upper < 0.5 * body_size)
             is_shooting_star = (wick_upper >= 2 * body_size) and (wick_lower < 0.5 * body_size)
 
@@ -160,244 +127,136 @@ class P3Backtester:
             c2_bullish = current['Close'] > current['Open']
             is_bullish_engulfing = c1_bearish and c2_bullish and (current['Close'] > prev['Open']) and (current['Open'] < prev['Close'])
 
-            if is_hammer or is_shooting_star or is_bearish_engulfing or is_bullish_engulfing:
-                tracking_data['raw_patterns'] += 1
-
-            # 1. Hammer (Bullish)
-            bullish_context = self.dual_regime_rsi(rsi, is_bullish=True, price=current['Close'], ema=ema)
-            if is_hammer and bullish_context and current['Close'] > ema and range_len > atr:
-                if is_valid_session:
-                    df.at[df.index[i], 'Pattern'] = 'Hammer'
-                    df.at[df.index[i], 'Signal'] = 'Bullish'
-                    if next_bar is not None and next_bar['Close'] > current['High']:
-                        df.at[df.index[i], 'Confirmed'] = True
-
-            # 2. Shooting Star (Bearish)
-            bearish_context = self.dual_regime_rsi(rsi, is_bullish=False, price=current['Close'], ema=ema)
-            if is_shooting_star and bearish_context and current['Close'] < ema and range_len > atr:
-                if is_valid_session:
-                    df.at[df.index[i], 'Pattern'] = 'Shooting Star'
-                    df.at[df.index[i], 'Signal'] = 'Bearish'
-                    if next_bar is not None and next_bar['Close'] < current['Low']:
-                        df.at[df.index[i], 'Confirmed'] = True
-
-            # 3. Bearish Engulfing
-            if is_bearish_engulfing and bearish_context and current['Close'] < ema and range_len > atr:
-                if is_valid_session:
-                    df.at[df.index[i], 'Pattern'] = 'Bearish Engulfing'
-                    df.at[df.index[i], 'Signal'] = 'Bearish'
-                    if next_bar is not None and next_bar['Close'] < current['Low']:
-                        df.at[df.index[i], 'Confirmed'] = True
-
-            # 4. Bullish Engulfing
-            # Protocol note: Bullish engulfing specifically requires RSI < 30
-            strict_bullish_context = (current['Close'] > ema) and (rsi < 30)
-            if is_bullish_engulfing and strict_bullish_context and range_len > atr:
-                if is_valid_session:
-                    df.at[df.index[i], 'Pattern'] = 'Bullish Engulfing'
-                    df.at[df.index[i], 'Signal'] = 'Bullish'
-                    if next_bar is not None and next_bar['Close'] > current['High']:
-                        df.at[df.index[i], 'Confirmed'] = True
-
-        return df
-
-    def evaluate_trade(self, bars, signal, entry, sl, tp1, tp2):
-        """Evaluates trade progression bar-by-bar to determine final R-multiple."""
-        tp1_hit = False
-        original_risk = abs(entry - sl)
-        if original_risk == 0:
-            return 0.0
-
-        for _, bar in bars.iterrows():
-            high, low, close = bar['High'], bar['Low'], bar['Close']
-
-            if signal == 'Bullish':
-                if low <= sl:
-                    return -1.0 if not tp1_hit else 0.75 # 0.5 * 1.5R secured at TP1, remainder BE
-                if high >= tp1 and not tp1_hit:
-                    tp1_hit = True
-                    sl = entry # Move stop to BE
-                if high >= tp2 and tp1_hit:
-                    return 2.25 # TP1 (0.5 * 1.5R) + TP2 (0.5 * 3.0R)
-
-            else: # Bearish
-                if high >= sl:
-                    return -1.0 if not tp1_hit else 0.75
-                if low <= tp1 and not tp1_hit:
-                    tp1_hit = True
-                    sl = entry
-                if low <= tp2 and tp1_hit:
-                    return 2.25
-
-        # Time stop (10 bars elapsed)
-        final_close = bars.iloc[-1]['Close']
-        if signal == 'Bullish':
-            floating_r = (final_close - entry) / original_risk
-        else:
-            floating_r = (entry - final_close) / original_risk
-
-        if tp1_hit:
-            return 0.75 + (0.5 * floating_r)
-        else:
-            # Full position closed at time stop
-            return floating_r
-
-    def run_backtest(self, ticker, df, tracking_data):
-        """Executes trades over the dataframe and computes metrics."""
-        trades_market = []
-        trades_stop = []
-
-        # Determine the pip increment for this ticker
-        pip_increment = self.PIP_MAP.get(ticker, 0.0001)
-
-        # We loop up to len(df)-10 to ensure we have room for the 10-bar time stop
-        for i in range(1, len(df) - 10):
-            if pd.isna(df['Signal'].iloc[i]):
+            if not any([is_hammer, is_shooting_star, is_bearish_engulfing, is_bullish_engulfing]):
                 continue
 
-            tracking_data['signals'] += 1
+            # CONFIG A: Pattern + Session + EMA200
+            is_valid_session = 8 <= current.name.hour <= 21
+            if not is_valid_session: continue
 
-            signal = df['Signal'].iloc[i]
-            # Pattern extreme (C bar extreme) is used for the SL, but the document asks for stop entries on C+1 extreme.
-            pattern_high = df['High'].iloc[i]
-            pattern_low = df['Low'].iloc[i]
+            signal = None
+            if is_hammer and current['Close'] > ema: signal = 'Bullish'
+            elif is_bullish_engulfing and current['Close'] > ema: signal = 'Bullish'
+            elif is_shooting_star and current['Close'] < ema: signal = 'Bearish'
+            elif is_bearish_engulfing and current['Close'] < ema: signal = 'Bearish'
 
-            c_plus_1 = df.iloc[i + 1] # C+1 bar
+            if not signal: continue
 
-            # SL is placed at Pattern (C bar) Extreme
+            pattern_high = current['High']
+            pattern_low = current['Low']
             sl = pattern_low if signal == 'Bullish' else pattern_high
 
-            # 1. Market-on-C+1-Close execution
             market_entry = c_plus_1['Close']
             market_risk = market_entry - sl if signal == 'Bullish' else sl - market_entry
 
-            if market_risk > 0: # valid risk
+            if market_risk > 0:
                 market_tp1 = market_entry + (1.5 * market_risk) if signal == 'Bullish' else market_entry - (1.5 * market_risk)
                 market_tp2 = market_entry + (3.0 * market_risk) if signal == 'Bullish' else market_entry - (3.0 * market_risk)
-
-                # Simulate forward 10 bars (starting from C+2)
                 forward_bars = df.iloc[i+2 : i+12]
-                trade_r = self.evaluate_trade(forward_bars, signal, market_entry, sl, market_tp1, market_tp2)
-                trades_market.append(trade_r)
+                r = self.evaluate_market_trade(forward_bars, signal, market_entry, sl, market_tp1, market_tp2)
+                trades_A.append(r - 0.05)
 
-            # 2. Method 3 Stop Order Execution
-            # Stop order placed 1 pip beyond C+1 extreme, simulated starting from C+2
-            if i + 2 < len(df):
-                c_plus_2 = df.iloc[i + 2]
+            # CONFIG B: Config A + Dual-Regime RSI + Volume > 1.2x Avg
+            bullish_context = self.dual_regime_rsi(rsi, True, current['Close'], ema)
+            bearish_context = self.dual_regime_rsi(rsi, False, current['Close'], ema)
 
-                c_plus_1_high = c_plus_1['High']
-                c_plus_1_low = c_plus_1['Low']
+            rsi_pass = (signal == 'Bullish' and bullish_context) or (signal == 'Bearish' and bearish_context)
+            vol_pass = (vol > 1.2 * avg_vol) or pd.isna(avg_vol) or avg_vol == 0
 
-                if signal == 'Bullish':
-                    stop_entry_price = c_plus_1_high + pip_increment # 1 pip beyond C+1 high
-                else:
-                    stop_entry_price = c_plus_1_low - pip_increment # 1 pip beyond C+1 low
+            if rsi_pass and vol_pass and market_risk > 0:
+                trades_B.append(r - 0.05)
 
-                triggered = False
-                stop_risk = stop_entry_price - sl if signal == 'Bullish' else sl - stop_entry_price
+                # CONFIG C: Config B + Exhaustion Filter (C+1 < 2x ATR) + Method 3 Stop (4 candles valid)
+                c_plus_1_range = c_plus_1['High'] - c_plus_1['Low']
+                exhaustion_pass = c_plus_1_range < (2 * atr)
 
-                if stop_risk > 0:
-                    # Check if C+2 hits the stop entry
-                    if signal == 'Bullish' and c_plus_2['High'] >= stop_entry_price:
-                        triggered = True
-                    elif signal == 'Bearish' and c_plus_2['Low'] <= stop_entry_price:
-                        triggered = True
+                if exhaustion_pass:
+                    stop_entry = c_plus_1['High'] + pip_inc if signal == 'Bullish' else c_plus_1['Low'] - pip_inc
+                    stop_risk = stop_entry - sl if signal == 'Bullish' else sl - stop_entry
 
-                    if triggered:
-                        stop_tp1 = stop_entry_price + (1.5 * stop_risk) if signal == 'Bullish' else stop_entry_price - (1.5 * stop_risk)
-                        stop_tp2 = stop_entry_price + (3.0 * stop_risk) if signal == 'Bullish' else stop_entry_price - (3.0 * stop_risk)
+                    if stop_risk > 0:
+                        stop_tp1 = stop_entry + (1.5 * stop_risk) if signal == 'Bullish' else stop_entry - (1.5 * stop_risk)
+                        stop_tp2 = stop_entry + (3.0 * stop_risk) if signal == 'Bullish' else stop_entry - (3.0 * stop_risk)
 
-                        # Forward bars include remainder of C+2 plus 9 bars
-                        forward_bars = df.iloc[i+2 : i+12]
-                        trade_r = self.evaluate_trade(forward_bars, signal, stop_entry_price, sl, stop_tp1, stop_tp2)
-                        trades_stop.append(trade_r)
-                        tracking_data['stop_exec'] += 1
+                        # Evaluate forward 4 bars for trigger
+                        triggered = False
+                        trigger_idx = -1
+                        for j in range(2, 6):
+                            test_bar = df.iloc[i+j]
+                            if signal == 'Bullish' and test_bar['High'] >= stop_entry:
+                                triggered = True
+                                trigger_idx = j
+                                break
+                            elif signal == 'Bearish' and test_bar['Low'] <= stop_entry:
+                                triggered = True
+                                trigger_idx = j
+                                break
 
-        return trades_market, trades_stop
+                        if triggered:
+                            forward_bars = df.iloc[i + trigger_idx : i + trigger_idx + 10]
+                            r_stop = self.evaluate_market_trade(forward_bars, signal, stop_entry, sl, stop_tp1, stop_tp2)
+                            trades_C.append(r_stop - 0.05)
 
-    def backtest_all(self):
-        """Runs the backtest across all tickers and outputs metrics table."""
+        return trades_A, trades_B, trades_C
+
+    def calc_metrics(self, trades):
+        n = len(trades)
+        if n == 0: return n, 0.0, 0.0, 0.0, "FAIL"
+        wins = [t for t in trades if t > 0]
+        losses = [t for t in trades if t <= 0]
+
+        wr = (len(wins) / n) * 100
+        pf = sum(wins) / (abs(sum(losses)) if sum(losses) != 0 else 0.0001)
+        status = "GO" if (wr >= 50 and pf >= 1.1) else "NO-GO"
+        return n, wr, np.mean(trades), pf, status
+
+    def run_all(self):
         results = []
-        funnel_results = []
+        counts = {'A': 0, 'B': 0, 'C': 0}
 
         for ticker in self.tickers:
-            tracking_data = {
-                'raw_patterns': 0,
-                'signals': 0,
-                'stop_exec': 0
-            }
-
             df = self.fetch_data(ticker)
-            if df.empty:
-                continue
+            if df.empty: continue
             df = self.calculate_indicators(df)
-            df = self.detect_patterns(df, tracking_data)
+            tA, tB, tC = self.run_funnel(ticker, df)
 
-            t_market, t_stop = self.run_backtest(ticker, df, tracking_data)
+            nA, wrA, avgA, pfA, stA = self.calc_metrics(tA)
+            nB, wrB, avgB, pfB, stB = self.calc_metrics(tB)
+            nC, wrC, avgC, pfC, stC = self.calc_metrics(tC)
 
-            funnel_results.append({
-                'Ticker': ticker,
-                'Raw Patterns': tracking_data['raw_patterns'],
-                'Passed Filters': tracking_data['signals'],
-                'Market Exec': len(t_market),
-                'Stop Exec': tracking_data['stop_exec']
-            })
+            counts['A'] += nA
+            counts['B'] += nB
+            counts['C'] += nC
 
-            def calc_metrics(trades, method_name):
-                if not trades:
-                    return [ticker, method_name, 0, 0.0, 0.0, 0.0, "-", "FAIL: INSUFFICIENT DATA"]
+            results.append([ticker, "A (Session+EMA)", nA, f"{wrA:.1f}", f"{pfA:.2f}", stA])
+            results.append([ticker, "B (+RSI+Vol)", nB, f"{wrB:.1f}", f"{pfB:.2f}", stB])
+            results.append([ticker, "C (+Exhaust+M3)", nC, f"{wrC:.1f}", f"{pfC:.2f}", stC])
 
-                n = len(trades)
-                wins = [t for t in trades if t > 0]
-                losses = [t for t in trades if t < 0]
+        print("## Protocol 3 H1 Funnel Analysis")
+        print("| Ticker | Config | N | WR | PF | Status |")
+        print("|--------|--------|---|----|----|--------|")
+        for r in results:
+            print(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
 
-                win_rate = len(wins) / n
-                win_rate_pct = win_rate * 100
-                avg_r = np.mean(trades)
+        print("\n## Funnel Diagnosis")
+        print(f"- **Config A (Base):** {counts['A']} trades")
+        print(f"- **Config B (RSI+Vol):** {counts['B']} trades")
+        print(f"- **Config C (Strict M3):** {counts['C']} trades")
 
-                gross_profit = sum(wins)
-                gross_loss = abs(sum(losses)) if sum(losses) != 0 else 0.0001
-                profit_factor = gross_profit / gross_loss
+        if counts['A'] > 0:
+            drop_ab = (counts['A'] - counts['B']) / counts['A'] * 100
+            print(f"**Drop-Off A -> B (RSI & Volume Filters):** -{drop_ab:.1f}%")
+            if drop_ab > 80:
+                print("⚠️ **Severe Drop-Off at B:** The Dual-Regime RSI and 1.2x Volume filters are choking out almost all H1 signals. The timeframe lacks the requisite volatility sweeps needed to meet these criteria.")
+            elif drop_ab > 50:
+                print("Moderate Drop-Off at B: RSI and Volume are filtering half the setups.")
 
-                # Wilson Score Interval (95% confidence -> z = 1.96)
-                z = 1.96
-                denominator = 1 + z**2/n
-                centre_adjusted_probability = win_rate + z**2 / (2*n)
-                adjusted_standard_deviation = math.sqrt((win_rate*(1 - win_rate) + z**2 / (4*n)) / n)
+        if counts['B'] > 0:
+            drop_bc = (counts['B'] - counts['C']) / counts['B'] * 100
+            print(f"**Drop-Off B -> C (Exhaustion & M3 Stop execution):** -{drop_bc:.1f}%")
+            if drop_bc > 50:
+                print("⚠️ **Severe Drop-Off at C:** The Method 3 Stop logic (1 pip beyond C+1) combined with the Exhaustion filter fails to trigger. The H1 momentum doesn't carry through the confirmation candle sufficiently.")
 
-                wilson_lower = (centre_adjusted_probability - z*adjusted_standard_deviation) / denominator
-                wilson_upper = (centre_adjusted_probability + z*adjusted_standard_deviation) / denominator
-
-                wilson_lb_pct = max(0.0, wilson_lower * 100)
-                wilson_ub_pct = min(100.0, wilson_upper * 100)
-
-                wilson_str = f"{wilson_lb_pct:.1f}% - {wilson_ub_pct:.1f}%"
-
-                if n < 15 or wilson_lb_pct < 48.0:
-                    pass_fail = "FAIL: INSUFFICIENT EDGE/DATA"
-                else:
-                    pass_fail = "PASS"
-
-                return [
-                    ticker, method_name, n, round(win_rate_pct, 2),
-                    round(avg_r, 2), round(profit_factor, 2),
-                    wilson_str, pass_fail
-                ]
-
-            results.append(calc_metrics(t_market, "Market-on-C+1-Close"))
-            results.append(calc_metrics(t_stop, "Method 3 Stop Order"))
-
-        print("\n--- Protocol 3 Funnel Tracking ---")
-        funnel_df = pd.DataFrame(funnel_results)
-        print(funnel_df.to_string(index=False))
-
-        print("\n--- Protocol 3: Backtest Performance Summary ---")
-        results_df = pd.DataFrame(results, columns=[
-            "Ticker", "Entry Logic", "Total Trades (N)", "Win Rate (%)",
-            "Avg R-Multiple", "Profit Factor", "Wilson CI (95%)", "Status"
-        ])
-        print(results_df.to_string(index=False))
-
-if __name__ == "__main__":
-    bt = P3Backtester()
-    bt.backtest_all()
+if __name__ == '__main__':
+    bt = P3H1Funnel()
+    bt.run_all()
