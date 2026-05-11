@@ -181,10 +181,12 @@ if trade_dir == 0
         initial_sl_dist := sl_dist
         max_r := 0.0
 
+var float current_r = 0.0
+
 // Active Trade Management
 if trade_dir == 1
     // Calculate current R
-    current_r = (h1_high - entry_price) / initial_sl_dist
+    current_r := (h1_high - entry_price) / initial_sl_dist
     if current_r > max_r
         max_r := current_r
 
@@ -216,7 +218,7 @@ if trade_dir == 1
         trade_dir := 0 // Close trade
 
 else if trade_dir == -1
-    current_r = (entry_price - h1_low) / initial_sl_dist
+    current_r := (entry_price - h1_low) / initial_sl_dist
     if current_r > max_r
         max_r := current_r
 
@@ -266,7 +268,7 @@ var table p_dash = table.new(p_pos, 2, 7, border_width=1, border_color=color.gra
 
 if barstate.islast
     // Header
-    table.cell(p_dash, 0, 0, "P5: MATS (" + i_instType + ")", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small, text_halign=text.align_center, text_weight=text.weight_bold, merge_right=true)
+    table.cell(p_dash, 0, 0, "P5: MATS (" + i_instType + ")", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small, text_halign=text.align_center)
 
     // Daily Bias
     string d_str = d_bullish ? "BULLISH" : (d_bearish ? "BEARISH" : "NEUTRAL")
