@@ -73,7 +73,7 @@ h1_ema21  = f_sec("60", ta.ema(close, 21))
 h1_ema50  = f_sec("60", ta.ema(close, 50))
 h1_rsi    = f_sec("60", ta.rsi(close, 14))
 h1_atr    = f_sec("60", ta.atr(14))
-[h1_adx, h1_pdi, h1_mdi] = f_sec("60", f_adx(14))
+[h1_adx, h1_pdi, h1_mdi] = request.security(syminfo.tickerid, "60", f_adx(14), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
 h1_vol    = f_sec("60", volume)
 h1_volSma = f_sec("60", ta.sma(volume, 20))
 
