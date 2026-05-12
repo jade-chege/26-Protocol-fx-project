@@ -9,8 +9,10 @@ i_instType = input.string("Forex/Standard", "Instrument Type", options=["Forex/S
 i_useVol   = input.bool(true, "Use Volume Filter (>150% avg)", group=groupInst, tooltip="Disable if Forex volume is unreliable")
 
 groupToggles = "Methods & Display"
-i_showMAs  = input.bool(true, "Show OneH EMAs (9, 21, 50)", group=groupToggles)
-i_showStop = input.bool(true, "Plot Active Trailing Stop", group=groupToggles)
+i_show1HMAs = input.bool(true, "Show 1H EMAs (9, 21, 50)", group=groupToggles)
+i_show4HMAs = input.bool(false, "Show 4H EMAs (9, 21, 50)", group=groupToggles)
+i_showD1SMA = input.bool(true, "Show Daily 200 SMA", group=groupToggles)
+i_showStop  = input.bool(true, "Plot Active Trailing Stop", group=groupToggles)
 i_tblPos   = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupToggles)
 
 // Base instrument settings defaults
@@ -48,7 +50,7 @@ f_adx(_len) =>
     [adx, plus, minus]
 
 // ------------------------------------------------------------
-//  DATA FETCHING (Daily, FourH, OneH)
+//  DATA FETCHING (Daily, 4H, 1H)
 // ------------------------------------------------------------
 // Helper to request data from different timeframes
 f_sec(_tf, _expr) => request.security(syminfo.tickerid, _tf, _expr, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
@@ -57,13 +59,13 @@ f_sec(_tf, _expr) => request.security(syminfo.tickerid, _tf, _expr, gaps=barmerg
 d_close   = f_sec("D", close)
 d_sma200  = f_sec("D", ta.sma(close, 200))
 
-// --- FourH Data ---
+// --- 4H Data ---
 h4_close  = f_sec("240", close)
 h4_ema9   = f_sec("240", ta.ema(close, 9))
 h4_ema21  = f_sec("240", ta.ema(close, 21))
 h4_ema50  = f_sec("240", ta.ema(close, 50))
 
-// --- OneH Data ---
+// --- 1H Data ---
 h1_close  = f_sec("60", close)
 h1_high   = f_sec("60", high)
 h1_low    = f_sec("60", low)
@@ -88,7 +90,7 @@ d_bearish = d_close < d_sma200
 if i_instType == "Indices"
     d_bearish := d_close < d_sma200 and h1_adx > 30
 
-// 2. FourH Setup
+// 2. 4H Setup
 h4_bullish = (h4_ema9 > h4_ema21) and (h4_ema21 > h4_ema50) and (h4_close > h4_ema50) and (h4_ema50 >= h4_ema50[1])
 h4_bearish = (h4_ema9 < h4_ema21) and (h4_ema21 < h4_ema50) and (h4_close < h4_ema50) and (h4_ema50 <= h4_ema50[1])
 
@@ -97,7 +99,7 @@ mtf_bull = d_bullish and h4_bullish
 mtf_bear = d_bearish and h4_bearish
 
 // ------------------------------------------------------------
-//  TRIGGER LOGIC (OneH)
+//  TRIGGER LOGIC (1H)
 // ------------------------------------------------------------
 // Helper: ADX conditions
 adx_valid_long  = h1_adx > baseAdxThr and (h1_adx >= h1_adx[1] or h1_adx > h1_adx[2]) // Rising or flat
@@ -248,10 +250,10 @@ else if trade_dir == -1
 // ------------------------------------------------------------
 //  VISUALS & DASHBOARD
 // ------------------------------------------------------------
-// Plot OneH EMAs
-plot(i_showMAs ? h1_ema9 : na, "OneH 9 EMA", color=color.blue, linewidth=1)
-plot(i_showMAs ? h1_ema21 : na, "OneH 21 EMA", color=color.orange, linewidth=2)
-plot(i_showMAs ? h1_ema50 : na, "OneH 50 EMA", color=color.white, linewidth=2)
+// Plot 1H EMAs
+plot(i_showMAs ? h1_ema9 : na, "1H 9 EMA", color=color.blue, linewidth=1)
+plot(i_showMAs ? h1_ema21 : na, "1H 21 EMA", color=color.orange, linewidth=2)
+plot(i_showMAs ? h1_ema50 : na, "1H 50 EMA", color=color.white, linewidth=2)
 
 // Plot Signals
 plotshape(m1_long_cond or m2_long_cond, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="L")
@@ -276,16 +278,16 @@ if barstate.islast
     table.cell(p_dash, 0, 1, "Daily 200 SMA Bias", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
     table.cell(p_dash, 1, 1, d_str, text_color=color.white, bgcolor=d_col, text_size=size.small)
 
-    // FourH Alignment
+    // 4H Alignment
     string h4_str = h4_bullish ? "BULL ALIGNED" : (h4_bearish ? "BEAR ALIGNED" : "MIXED")
     color h4_col = h4_bullish ? color.new(color.lime, 50) : (h4_bearish ? color.new(color.red, 50) : color.new(color.gray, 50))
-    table.cell(p_dash, 0, 2, "FourH EMA Alignment", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 0, 2, "4H EMA Alignment", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
     table.cell(p_dash, 1, 2, h4_str, text_color=color.white, bgcolor=h4_col, text_size=size.small)
 
-    // OneH ADX Status
+    // 1H ADX Status
     string adx_str = str.tostring(h1_adx, "#.#") + (adx_valid_long ? " (Valid)" : " (Weak)")
     color adx_col = adx_valid_long ? color.new(color.lime, 50) : color.new(color.gray, 50)
-    table.cell(p_dash, 0, 3, "OneH ADX (Momentum)", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 0, 3, "1H ADX (Momentum)", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
     table.cell(p_dash, 1, 3, adx_str, text_color=color.white, bgcolor=adx_col, text_size=size.small)
 
     // Vol Filter
