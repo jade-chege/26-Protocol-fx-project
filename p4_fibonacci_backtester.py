@@ -31,6 +31,7 @@ class P4FibonacciBacktester:
                       np.maximum(abs(df['High'] - df['Close'].shift(1)),
                                  abs(df['Low'] - df['Close'].shift(1))))
         df['ATR'] = wilder(df['TR'], 14)
+        df['ATR_SMA'] = df['ATR'].rolling(20).mean()
         df['VolSMA'] = df['Volume'].rolling(20).mean()
 
         # EMAs
@@ -44,14 +45,22 @@ class P4FibonacciBacktester:
         rs = gain / loss
         df['RSI'] = 100 - (100 / (1 + rs))
 
-        # ADX(14) - Simplified vectorized logic
-        df['H_diff'] = df['High'].diff()
-        df['L_diff'] = df['Low'].diff(-1)
-        df['plus_DM'] = np.where((df['H_diff'] > df['L_diff']) & (df['H_diff'] > 0), df['H_diff'], 0)
-        df['minus_DM'] = np.where((df['L_diff'] > df['H_diff']) & (df['L_diff'] > 0), df['L_diff'], 0)
-        df['plus_DI'] = 100 * wilder(df['plus_DM'], 14) / df['ATR']
-        df['minus_DI'] = 100 * wilder(df['minus_DM'], 14) / df['ATR']
-        df['DX'] = 100 * abs(df['plus_DI'] - df['minus_DI']) / (df['plus_DI'] + df['minus_DI'])
+        # ADX(14) - Wilder's Vectorized
+        high = df['High']
+        low = df['Low']
+        high_shift = high.shift(1)
+        low_shift = low.shift(1)
+
+        plusDM = np.where((high - high_shift) > (low_shift - low), np.maximum(high - high_shift, 0), 0)
+        minusDM = np.where((low_shift - low) > (high - high_shift), np.maximum(low_shift - low, 0), 0)
+
+        plusDM_series = pd.Series(plusDM, index=df.index)
+        minusDM_series = pd.Series(minusDM, index=df.index)
+
+        plusDI = 100 * wilder(plusDM_series, 14) / df['ATR']
+        minusDI = 100 * wilder(minusDM_series, 14) / df['ATR']
+
+        df['DX'] = 100 * abs(plusDI - minusDI) / (plusDI + minusDI)
         df['ADX'] = wilder(df['DX'], 14)
 
         self.df = df.dropna()
@@ -71,6 +80,51 @@ class P4FibonacciBacktester:
                             (df['Low'].shift(2) < df['Low'].shift(1)) & \
                             (df['Low'].shift(2) < df['Low'].shift(0))
         self.df = df
+
+
+    def detect_pattern_tier(self, i):
+        df = self.df
+        row = df.iloc[i]
+        prev = df.iloc[i-1]
+        prev2 = df.iloc[i-2]
+
+        def is_bullish(r): return r['Close'] > r['Open']
+        def is_bearish(r): return r['Close'] < r['Open']
+        def body(r): return abs(r['Close'] - r['Open'])
+        def r_range(r): return r['High'] - r['Low']
+        def upper_wick(r): return r['High'] - max(r['Open'], r['Close'])
+        def lower_wick(r): return min(r['Open'], r['Close']) - r['Low']
+        def midpoint(r): return (r['Open'] + r['Close']) / 2.0
+
+        # Tier 1 - Bullish Engulfing
+        if is_bearish(prev) and is_bullish(row) and row['Open'] < prev['Close'] and row['Close'] > prev['Open']:
+            return 1, 'LONG'
+        # Tier 1 - Bearish Engulfing
+        if is_bullish(prev) and is_bearish(row) and row['Open'] > prev['Close'] and row['Close'] < prev['Open']:
+            return 1, 'SHORT'
+
+        # Tier 1 - Morning Star
+        if is_bearish(prev2) and (body(prev) < 0.3 * r_range(prev)) and is_bullish(row) and row['Close'] > midpoint(prev2):
+            return 1, 'LONG'
+        # Tier 1 - Evening Star
+        if is_bullish(prev2) and (body(prev) < 0.3 * r_range(prev)) and is_bearish(row) and row['Close'] < midpoint(prev2):
+            return 1, 'SHORT'
+
+        # Tier 2 - Hammer (Bullish)
+        if lower_wick(row) >= 2 * body(row) and upper_wick(row) <= 0.5 * body(row) and row['Close'] >= row['Low'] + 0.75 * r_range(row):
+            return 2, 'LONG'
+        # Tier 2 - Shooting Star (Bearish)
+        if upper_wick(row) >= 2 * body(row) and lower_wick(row) <= 0.5 * body(row) and row['Close'] <= row['Low'] + 0.25 * r_range(row):
+            return 2, 'SHORT'
+
+        # Tier 3 - Doji (Bullish / Bearish based on RSI)
+        if r_range(row) > 0 and (body(row) / r_range(row)) <= 0.10 and upper_wick(row) > 0 and lower_wick(row) > 0:
+            if row['RSI'] < 30:
+                return 3, 'LONG'
+            if row['RSI'] > 70:
+                return 3, 'SHORT'
+
+        return 0, None
 
     def wilson_ci_lower(self, wins, n, confidence=0.95):
         if n == 0: return 0
@@ -147,8 +201,10 @@ class P4FibonacciBacktester:
 
         last_swing_high = None
         last_swing_low = None
+        use_from_bar_high = 0
+        use_from_bar_low = 0
 
-        for i in range(200, len(df)): # Skip first 200 bars for EMA/ADX burn-in
+        for i in range(200, len(df)):
             row = df.iloc[i]
             prev_row = df.iloc[i-1]
 
@@ -162,37 +218,49 @@ class P4FibonacciBacktester:
             # Update Swings (using fractal signals from i-2)
             if df['Fractal_High'].iloc[i]:
                 last_swing_high = df.iloc[i-2]['High']
+                use_from_bar_high = i + 2
+                self.funnel['fractals_detected'] += 1
             if df['Fractal_Low'].iloc[i]:
                 last_swing_low = df.iloc[i-2]['Low']
+                use_from_bar_low = i + 2
+                self.funnel['fractals_detected'] += 1
 
             # 2. DETECT SIGNALS
             if last_swing_high is not None and last_swing_low is not None:
+                if i < use_from_bar_high or i < use_from_bar_low:
+                    continue
+
                 # Check swing distance
                 swing_dist = abs(last_swing_high - last_swing_low)
-                if swing_dist < 1.0 * row['ATR']: # Relaxed to 1.0x ATR for Phase 1B per blueprint
+                if swing_dist < 1.5 * row['ATR']:
                     continue
 
                 self.funnel['valid_swings'] += 1
 
-                # LONG SETUP
-                if self.check_market_gates(row, prev_row, direction='LONG'):
-                    # Retracement from high to low (Uptrend: Swing Low -> Swing High)
-                    # Pullback goes DOWN to fib levels
-                    fib_50 = last_swing_low + (last_swing_high - last_swing_low) * 0.50
-                    fib_618 = last_swing_low + (last_swing_high - last_swing_low) * 0.382 # 1 - 0.618
-                    fib_786 = last_swing_low + (last_swing_high - last_swing_low) * 0.214 # 1 - 0.786
+                tier, p_dir = self.detect_pattern_tier(i)
 
-                    # Golden Zone
+                # LONG SETUP
+                if p_dir == 'LONG':
+                    fib_50 = last_swing_low + (last_swing_high - last_swing_low) * 0.50
+                    fib_618 = last_swing_low + (last_swing_high - last_swing_low) * 0.382
                     golden_high = fib_50
                     golden_low = fib_618
 
-                    # Price pulling back to Fib Golden/OTE
                     if golden_low <= row['Low'] <= golden_high or golden_low <= row['Close'] <= golden_high:
                         self.funnel['fib_zones_active'] += 1
-                        self.funnel['market_gates_passed'] += 1
 
-                        # Confluence Check (Simplified: Require volume > 1.0x for Phase 1B)
-                        if row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 0.0: # relaxed for phase 1b
+                        if self.check_market_gates(row, prev_row, direction='LONG'):
+                            self.funnel['market_gates_passed'] += 1
+
+                        vol_ok = False
+                        if tier == 1:
+                            vol_ok = True
+                        elif tier == 2 and (row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 1.2 * row['VolSMA']):
+                            vol_ok = True
+                        elif tier == 3 and (row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 1.2 * row['VolSMA']) and row['RSI'] < 30:
+                            vol_ok = True
+
+                        if vol_ok:
                             self.funnel['pattern_confirmed'] += 1
                             self.funnel['signals_generated'] += 1
 
@@ -201,37 +269,46 @@ class P4FibonacciBacktester:
                                 'entry_price': row['Close'],
                                 'stop_loss': last_swing_low - (1.5 * row['ATR']),
                                 'initial_risk': abs(row['Close'] - (last_swing_low - (1.5 * row['ATR']))),
-                                'tp1': row['Close'] + 1.0 * abs(row['Close'] - (last_swing_low - (1.5 * row['ATR']))),
-                                'tp2': row['Close'] + 2.0 * abs(row['Close'] - (last_swing_low - (1.5 * row['ATR']))),
-                                'tp3': row['Close'] + 3.0 * abs(row['Close'] - (last_swing_low - (1.5 * row['ATR']))),
+                                'tp1': last_swing_high,
+                                'tp2': last_swing_high + (swing_dist * 0.272),
+                                'tp3': last_swing_high + (swing_dist * 0.618),
+                                'tp4': last_swing_high + (swing_dist * 1.618),
                                 'status': 'OPEN',
                                 'entry_time': i,
                                 'bars_held': 0,
                                 'size': 1.0,
-                                'highest_high': row['High']
+                                'locked_pnl_r': 0.0,
+                                't1_hit': False,
+                                't2_hit': False,
+                                'highest_high': row['High'],
+                                'volatility_ratio': row['ATR'] / row['ATR_SMA'] if pd.notna(row['ATR_SMA']) and row['ATR_SMA'] > 0 else 1.0
                             }
-                            # Avoid overlapping trades
                             if not any(t['direction'] == 'LONG' for t in active_trades):
                                 active_trades.append(new_trade)
                                 self.funnel['trades_executed'] += 1
 
                 # SHORT SETUP
-                if self.check_market_gates(row, prev_row, direction='SHORT'):
-                    # Retracement from low to high (Downtrend: Swing High -> Swing Low)
-                    # Pullback goes UP to fib levels
+                if p_dir == 'SHORT':
                     fib_50 = last_swing_high - (last_swing_high - last_swing_low) * 0.50
                     fib_618 = last_swing_high - (last_swing_high - last_swing_low) * 0.382
-                    fib_786 = last_swing_high - (last_swing_high - last_swing_low) * 0.214
-
-                    # Golden Zone
                     golden_low = fib_50
                     golden_high = fib_618
 
                     if golden_low <= row['High'] <= golden_high or golden_low <= row['Close'] <= golden_high:
                         self.funnel['fib_zones_active'] += 1
-                        self.funnel['market_gates_passed'] += 1
 
-                        if row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 0.0: # relaxed for phase 1b
+                        if self.check_market_gates(row, prev_row, direction='SHORT'):
+                            self.funnel['market_gates_passed'] += 1
+
+                        vol_ok = False
+                        if tier == 1:
+                            vol_ok = True
+                        elif tier == 2 and (row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 1.2 * row['VolSMA']):
+                            vol_ok = True
+                        elif tier == 3 and (row['Volume'] == 0 or np.isnan(row['VolSMA']) or row['Volume'] > 1.2 * row['VolSMA']) and row['RSI'] > 70:
+                            vol_ok = True
+
+                        if vol_ok:
                             self.funnel['pattern_confirmed'] += 1
                             self.funnel['signals_generated'] += 1
 
@@ -240,14 +317,19 @@ class P4FibonacciBacktester:
                                 'entry_price': row['Close'],
                                 'stop_loss': last_swing_high + (1.5 * row['ATR']),
                                 'initial_risk': abs((last_swing_high + (1.5 * row['ATR'])) - row['Close']),
-                                'tp1': row['Close'] - 1.0 * abs((last_swing_high + (1.5 * row['ATR'])) - row['Close']),
-                                'tp2': row['Close'] - 2.0 * abs((last_swing_high + (1.5 * row['ATR'])) - row['Close']),
-                                'tp3': row['Close'] - 3.0 * abs((last_swing_high + (1.5 * row['ATR'])) - row['Close']),
+                                'tp1': last_swing_low,
+                                'tp2': last_swing_low - (swing_dist * 0.272),
+                                'tp3': last_swing_low - (swing_dist * 0.618),
+                                'tp4': last_swing_low - (swing_dist * 1.618),
                                 'status': 'OPEN',
                                 'entry_time': i,
                                 'bars_held': 0,
                                 'size': 1.0,
-                                'lowest_low': row['Low']
+                                'locked_pnl_r': 0.0,
+                                't1_hit': False,
+                                't2_hit': False,
+                                'lowest_low': row['Low'],
+                                'volatility_ratio': row['ATR'] / row['ATR_SMA'] if pd.notna(row['ATR_SMA']) and row['ATR_SMA'] > 0 else 1.0
                             }
                             if not any(t['direction'] == 'SHORT' for t in active_trades):
                                 active_trades.append(new_trade)
@@ -256,58 +338,104 @@ class P4FibonacciBacktester:
     def manage_trade(self, trade, row, i):
         trade['bars_held'] += 1
 
-        # Time exit: 30 H4 candles without T1 -> close 100%
-        if trade['bars_held'] >= 30:
+        # Time exits
+        if trade['bars_held'] >= 30 and not trade['t1_hit']:
             trade['status'] = 'CLOSED'
             trade['exit_price'] = row['Close']
-            trade['pnl_r'] = (row['Close'] - trade['entry_price']) / trade['initial_risk'] if trade['direction'] == 'LONG' else (trade['entry_price'] - row['Close']) / trade['initial_risk']
+
+            if trade['direction'] == 'LONG':
+                trade['locked_pnl_r'] += trade['size'] * ((trade['exit_price'] - trade['entry_price']) / trade['initial_risk'])
+            else:
+                trade['locked_pnl_r'] += trade['size'] * ((trade['entry_price'] - trade['exit_price']) / trade['initial_risk'])
+            trade['pnl_r'] = trade['locked_pnl_r']
             return
+
+        # 20 bars without T1 and profit > 0
+        if trade['bars_held'] >= 20 and not trade['t1_hit']:
+            is_profit = (row['Close'] > trade['entry_price']) if trade['direction'] == 'LONG' else (row['Close'] < trade['entry_price'])
+            if is_profit:
+                trade['status'] = 'CLOSED'
+                trade['exit_price'] = row['Close']
+
+                if trade['direction'] == 'LONG':
+                    trade['locked_pnl_r'] += trade['size'] * ((trade['exit_price'] - trade['entry_price']) / trade['initial_risk'])
+                else:
+                    trade['locked_pnl_r'] += trade['size'] * ((trade['entry_price'] - trade['exit_price']) / trade['initial_risk'])
+                trade['pnl_r'] = trade['locked_pnl_r']
+                return
 
         if trade['direction'] == 'LONG':
             trade['highest_high'] = max(trade['highest_high'], row['High'])
 
-            # SL hit
+            # Check Trailing/SL hit first
             if row['Low'] <= trade['stop_loss']:
                 trade['status'] = 'CLOSED'
                 trade['exit_price'] = trade['stop_loss']
-                trade['pnl_r'] = -1.0
+                trade['locked_pnl_r'] += trade['size'] * ((trade['exit_price'] - trade['entry_price']) / trade['initial_risk'])
+                trade['pnl_r'] = trade['locked_pnl_r']
                 return
 
-            # Trailing stop logic after TP1
-            if row['High'] >= trade['tp1'] and trade['stop_loss'] < trade['entry_price']:
-                trade['stop_loss'] = trade['entry_price'] # Breakeven
+            # Check T1
+            if row['High'] >= trade['tp1'] and not trade['t1_hit']:
+                trade['locked_pnl_r'] += 0.5 * ((trade['tp1'] - trade['entry_price']) / trade['initial_risk'])
+                trade['size'] -= 0.5
+                trade['stop_loss'] = trade['entry_price']
+                trade['t1_hit'] = True
 
-            if row['High'] >= trade['tp2']:
-                trade['stop_loss'] = max(trade['stop_loss'], trade['tp1'])
+            # Check T2
+            if row['High'] >= trade['tp2'] and trade['t1_hit'] and not trade['t2_hit']:
+                trade['locked_pnl_r'] += 0.25 * ((trade['tp2'] - trade['entry_price']) / trade['initial_risk'])
+                trade['size'] -= 0.25
+                trade['stop_loss'] = trade['tp1']
+                trade['t2_hit'] = True
 
-            if row['High'] >= trade['tp3']:
+            # Check T3/T4 - wait, instructions say "At T3/Trail/Stop: Close remaining... at exit_price"
+            # It just means trail stop takes care of exit, or T3 takes care of it. We'll close at T3.
+            if row['High'] >= trade['tp3'] and trade['t2_hit']:
                 trade['status'] = 'CLOSED'
                 trade['exit_price'] = trade['tp3']
-                trade['pnl_r'] = 3.0
+                trade['locked_pnl_r'] += trade['size'] * ((trade['exit_price'] - trade['entry_price']) / trade['initial_risk'])
+                trade['pnl_r'] = trade['locked_pnl_r']
                 return
+
+            # Trailing logic
+            if trade['t2_hit']:
+                trade['stop_loss'] = max(trade['stop_loss'], trade['highest_high'] - (2.0 * row['ATR']))
 
         elif trade['direction'] == 'SHORT':
             trade['lowest_low'] = min(trade['lowest_low'], row['Low'])
 
-            # SL hit
             if row['High'] >= trade['stop_loss']:
                 trade['status'] = 'CLOSED'
                 trade['exit_price'] = trade['stop_loss']
-                trade['pnl_r'] = -1.0
+                trade['locked_pnl_r'] += trade['size'] * ((trade['entry_price'] - trade['exit_price']) / trade['initial_risk'])
+                trade['pnl_r'] = trade['locked_pnl_r']
                 return
 
-            # Trailing stop logic after TP1
-            if row['Low'] <= trade['tp1'] and trade['stop_loss'] > trade['entry_price']:
-                trade['stop_loss'] = trade['entry_price'] # Breakeven
+            # Check T1
+            if row['Low'] <= trade['tp1'] and not trade['t1_hit']:
+                trade['locked_pnl_r'] += 0.5 * ((trade['entry_price'] - trade['tp1']) / trade['initial_risk'])
+                trade['size'] -= 0.5
+                trade['stop_loss'] = trade['entry_price']
+                trade['t1_hit'] = True
 
-            if row['Low'] <= trade['tp2']:
-                trade['stop_loss'] = min(trade['stop_loss'], trade['tp1'])
+            # Check T2
+            if row['Low'] <= trade['tp2'] and trade['t1_hit'] and not trade['t2_hit']:
+                trade['locked_pnl_r'] += 0.25 * ((trade['entry_price'] - trade['tp2']) / trade['initial_risk'])
+                trade['size'] -= 0.25
+                trade['stop_loss'] = trade['tp1']
+                trade['t2_hit'] = True
 
-            if row['Low'] <= trade['tp3']:
+            if row['Low'] <= trade['tp3'] and trade['t2_hit']:
                 trade['status'] = 'CLOSED'
                 trade['exit_price'] = trade['tp3']
-                trade['pnl_r'] = 3.0
+                trade['locked_pnl_r'] += trade['size'] * ((trade['entry_price'] - trade['exit_price']) / trade['initial_risk'])
+                trade['pnl_r'] = trade['locked_pnl_r']
                 return
+
+            # Trailing logic
+            if trade['t2_hit']:
+                trade['stop_loss'] = min(trade['stop_loss'], trade['lowest_low'] + (2.0 * row['ATR']))
 
     def run(self):
         self.load_data()
