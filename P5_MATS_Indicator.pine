@@ -1,0 +1,311 @@
+//@version=6
+indicator("Protocol 5: Moving Average Trend System (MATS)", shorttitle="P5 MATS", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ------------------------------------------------------------
+//  INPUTS & CONFIGURATION
+// ------------------------------------------------------------
+groupInst = "Instrument Configuration"
+i_instType = input.string("Forex/Standard", "Instrument Type", options=["Forex/Standard", "Gold (XAUUSD)", "Silver (XAGUSD)", "Oil (USOIL)", "Indices"], group=groupInst)
+i_useVol   = input.bool(true, "Use Volume Filter (>150% avg)", group=groupInst, tooltip="Disable if Forex volume is unreliable")
+
+groupToggles = "Methods & Display"
+i_show1HMAs = input.bool(true, "Show 1H EMAs (9, 21, 50)", group=groupToggles)
+i_show4HMAs = input.bool(false, "Show 4H EMAs (9, 21, 50)", group=groupToggles)
+i_showD1SMA = input.bool(true, "Show Daily 200 SMA", group=groupToggles)
+i_showStop  = input.bool(true, "Plot Active Trailing Stop", group=groupToggles)
+i_tblPos   = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupToggles)
+
+// Base instrument settings defaults
+float baseAtrMult = 2.0
+float baseAdxThr  = 25.0
+int   baseVolThr  = 150 // %
+
+if i_instType == "Gold (XAUUSD)"
+    baseAtrMult := 2.5
+    baseAdxThr  := 30.0
+else if i_instType == "Silver (XAGUSD)"
+    baseAtrMult := 3.0
+    baseAdxThr  := 30.0
+else if i_instType == "Oil (USOIL)"
+    baseAtrMult := 2.5
+    baseAdxThr  := 28.0
+else if i_instType == "Indices"
+    baseAtrMult := 2.5
+    baseAdxThr  := 25.0 // Longs standard, shorts higher (handled in logic)
+
+// ------------------------------------------------------------
+//  CORE FUNCTIONS (Wilders Smoothing)
+// ------------------------------------------------------------
+// ADX Calculation
+f_adx(_len) =>
+    up = ta.change(high)
+    down = -ta.change(low)
+    plusDM = na(up) ? na : (up > down and up > 0 ? up : 0)
+    minusDM = na(down) ? na : (down > up and down > 0 ? down : 0)
+    trur = ta.rma(ta.tr, _len)
+    plus = fixnan(100 * ta.rma(plusDM, _len) / trur)
+    minus = fixnan(100 * ta.rma(minusDM, _len) / trur)
+    sum = plus + minus
+    adx = 100 * ta.rma(math.abs(plus - minus) / (sum == 0 ? 1 : sum), _len)
+    [adx, plus, minus]
+
+// ------------------------------------------------------------
+//  DATA FETCHING (Daily, 4H, 1H)
+// ------------------------------------------------------------
+// Helper to request data from different timeframes
+f_sec(_tf, _expr) => request.security(syminfo.tickerid, _tf, _expr, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// --- Daily Data ---
+d_close   = f_sec("D", close)
+d_sma200  = f_sec("D", ta.sma(close, 200))
+
+// --- 4H Data ---
+h4_close  = f_sec("240", close)
+h4_ema9   = f_sec("240", ta.ema(close, 9))
+h4_ema21  = f_sec("240", ta.ema(close, 21))
+h4_ema50  = f_sec("240", ta.ema(close, 50))
+
+// --- 1H Data ---
+h1_close  = f_sec("60", close)
+h1_high   = f_sec("60", high)
+h1_low    = f_sec("60", low)
+h1_open   = f_sec("60", open)
+h1_ema9   = f_sec("60", ta.ema(close, 9))
+h1_ema21  = f_sec("60", ta.ema(close, 21))
+h1_ema50  = f_sec("60", ta.ema(close, 50))
+h1_rsi    = f_sec("60", ta.rsi(close, 14))
+h1_atr    = f_sec("60", ta.atr(14))
+[h1_adx, h1_pdi, h1_mdi] = request.security(syminfo.tickerid, "60", f_adx(14), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+h1_vol    = f_sec("60", volume)
+h1_volSma = f_sec("60", ta.sma(volume, 20))
+
+// ------------------------------------------------------------
+//  ALIGNMENT LOGIC
+// ------------------------------------------------------------
+// 1. Daily Bias
+d_bullish = d_close > d_sma200
+d_bearish = d_close < d_sma200
+
+// Indices require stronger trend evidence for shorts
+if i_instType == "Indices"
+    d_bearish := d_close < d_sma200 and h1_adx > 30
+
+// 2. 4H Setup
+h4_bullish = (h4_ema9 > h4_ema21) and (h4_ema21 > h4_ema50) and (h4_close > h4_ema50) and (h4_ema50 >= h4_ema50[1])
+h4_bearish = (h4_ema9 < h4_ema21) and (h4_ema21 < h4_ema50) and (h4_close < h4_ema50) and (h4_ema50 <= h4_ema50[1])
+
+// 3. Multi-Timeframe Agreement
+mtf_bull = d_bullish and h4_bullish
+mtf_bear = d_bearish and h4_bearish
+
+// ------------------------------------------------------------
+//  TRIGGER LOGIC (1H)
+// ------------------------------------------------------------
+// Helper: ADX conditions
+adx_valid_long  = h1_adx > baseAdxThr and (h1_adx >= h1_adx[1] or h1_adx > h1_adx[2]) // Rising or flat
+adx_valid_short = adx_valid_long
+if i_instType == "Indices"
+    adx_valid_short := h1_adx > (baseAdxThr + 5) // Shorts require higher ADX on indices
+
+// Helper: Volume filter
+vol_valid = i_useVol ? (h1_vol > (h1_volSma * (baseVolThr / 100.0))) : true
+
+// Method 1: Crossover
+m1_crossUp = ta.crossover(h1_ema9, h1_ema21)
+m1_crossDn = ta.crossunder(h1_ema9, h1_ema21)
+
+// Check crossovers in last 50 bars (Whipsaw filter)
+cross_count_50 = math.sum(m1_crossUp ? 1 : (m1_crossDn ? 1 : 0), 50)
+whipsaw_pass = (i_instType == "Silver (XAGUSD)") ? (cross_count_50 <= 2) : (cross_count_50 < 3)
+
+m1_long_cond = mtf_bull and adx_valid_long and (h1_rsi > 50) and m1_crossUp and vol_valid and whipsaw_pass and (math.abs(h1_close - h1_ema21) <= (2 * h1_atr))
+m1_short_cond = mtf_bear and adx_valid_short and (h1_rsi < 50) and m1_crossDn and vol_valid and whipsaw_pass and (math.abs(h1_close - h1_ema21) <= (2 * h1_atr))
+
+// Method 2: Pullback
+adx_sustained = math.sum(h1_adx > baseAdxThr ? 1 : 0, 20) >= 20 // ADX > 25 for at least 20 consecutive bars
+
+// Pullback logic: Price pulls back to 50 EMA, rejects, and breaks rejection candles high
+var int pb_long_state = 0 // 0 = none, 1 = touched 50, waiting for break
+var float pb_long_trigger_price = na
+var int pb_short_state = 0
+var float pb_short_trigger_price = na
+
+// Long pullback conditions
+if mtf_bull and adx_sustained
+    // Touched 50 EMA but closed above it
+    if (h1_low <= h1_ema50 or h1_close <= h1_ema50) and h1_close > h1_ema50 and (i_useVol ? (h1_vol >= h1_volSma) : true)
+        pb_long_state := 1
+        pb_long_trigger_price := h1_high
+
+m2_long_cond = false
+if pb_long_state == 1 and h1_high > pb_long_trigger_price
+    m2_long_cond := true
+    pb_long_state := 0 // Reset
+
+// Short pullback conditions
+if mtf_bear and adx_sustained
+    if (h1_high >= h1_ema50 or h1_close >= h1_ema50) and h1_close < h1_ema50 and (i_useVol ? (h1_vol >= h1_volSma) : true)
+        pb_short_state := 1
+        pb_short_trigger_price := h1_low
+
+m2_short_cond = false
+if pb_short_state == 1 and h1_low < pb_short_trigger_price
+    m2_short_cond := true
+    pb_short_state := 0 // Reset
+
+// ------------------------------------------------------------
+//  SIMULATED TRADE & TRAILING STOP LOGIC
+// ------------------------------------------------------------
+var int   trade_dir = 0 // 1 = long, -1 = short, 0 = flat
+var float entry_price = na
+var float sl_price = na
+var float max_r = 0.0
+var float initial_sl_dist = na
+
+// Entry Logic
+if trade_dir == 0
+    if m1_long_cond or m2_long_cond
+        trade_dir := 1
+        entry_price := h1_close
+        sl_dist = baseAtrMult * h1_atr
+        if m2_long_cond
+            sl_dist := (h1_close - h1_ema50) + (0.5 * h1_atr) // M2 tighter stop
+        sl_price := entry_price - sl_dist
+        initial_sl_dist := sl_dist
+        max_r := 0.0
+    else if m1_short_cond or m2_short_cond
+        trade_dir := -1
+        entry_price := h1_close
+        sl_dist = baseAtrMult * h1_atr
+        if m2_short_cond
+            sl_dist := (h1_ema50 - h1_close) + (0.5 * h1_atr)
+        sl_price := entry_price + sl_dist
+        initial_sl_dist := sl_dist
+        max_r := 0.0
+
+var float current_r = 0.0
+
+// Active Trade Management
+if trade_dir == 1
+    // Calculate current R
+    current_r := (h1_high - entry_price) / initial_sl_dist
+    if current_r > max_r
+        max_r := current_r
+
+    // Trail: +1.0R -> breakeven
+    if max_r >= 1.0 and sl_price < entry_price
+        sl_price := entry_price
+
+    // Trail: +1.5R -> 0.25 ATR below low of most recent candle that closed above 9 EMA
+    if max_r >= 1.5 and max_r < 2.0
+        if h1_close > h1_ema9
+            new_sl = h1_low - (0.25 * h1_atr)
+            if new_sl > sl_price
+                sl_price := new_sl
+
+    // Trail: +2.0R -> 0.5 ATR below 9 EMA
+    if max_r >= 2.0 and max_r < 3.0
+        new_sl = h1_ema9 - (0.5 * h1_atr)
+        if new_sl > sl_price
+            sl_price := new_sl
+
+    // Trail: +3.0R -> Trail below 21 EMA
+    if max_r >= 3.0
+        new_sl = h1_ema21 - (0.1 * h1_atr)
+        if new_sl > sl_price
+            sl_price := new_sl
+
+    // Exit Logic
+    if h1_low <= sl_price or m1_crossDn or h1_adx < 20
+        trade_dir := 0 // Close trade
+
+else if trade_dir == -1
+    current_r := (entry_price - h1_low) / initial_sl_dist
+    if current_r > max_r
+        max_r := current_r
+
+    if max_r >= 1.0 and sl_price > entry_price
+        sl_price := entry_price
+
+    if max_r >= 1.5 and max_r < 2.0
+        if h1_close < h1_ema9
+            new_sl = h1_high + (0.25 * h1_atr)
+            if new_sl < sl_price
+                sl_price := new_sl
+
+    if max_r >= 2.0 and max_r < 3.0
+        new_sl = h1_ema9 + (0.5 * h1_atr)
+        if new_sl < sl_price
+            sl_price := new_sl
+
+    if max_r >= 3.0
+        new_sl = h1_ema21 + (0.1 * h1_atr)
+        if new_sl < sl_price
+            sl_price := new_sl
+
+    // Exit Logic
+    if h1_high >= sl_price or m1_crossUp or h1_adx < 20
+        trade_dir := 0 // Close trade
+
+// ------------------------------------------------------------
+//  VISUALS & DASHBOARD
+// ------------------------------------------------------------
+// Plot 1H EMAs
+plot(i_showMAs ? h1_ema9 : na, "1H 9 EMA", color=color.blue, linewidth=1)
+plot(i_showMAs ? h1_ema21 : na, "1H 21 EMA", color=color.orange, linewidth=2)
+plot(i_showMAs ? h1_ema50 : na, "1H 50 EMA", color=color.white, linewidth=2)
+
+// Plot Signals
+plotshape(m1_long_cond or m2_long_cond, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="L")
+plotshape(m1_short_cond or m2_short_cond, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="S")
+
+// Plot Trailing Stop
+plot(i_showStop and trade_dir != 0 ? sl_price : na, "Active Stop Loss", color=color.red, style=plot.style_cross, linewidth=2)
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DASHBOARD
+// ---------------------------------------------------------------------------------------------------------------------
+var string p_pos = i_tblPos == "Top Right" ? position.top_right : i_tblPos == "Top Left" ? position.top_left : i_tblPos == "Bottom Right" ? position.bottom_right : position.bottom_left
+var table p_dash = table.new(p_pos, 2, 7, border_width=1, border_color=color.gray, frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(p_dash, 0, 0, "P5: MATS (" + i_instType + ")", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small, text_halign=text.align_center)
+
+    // Daily Bias
+    string d_str = d_bullish ? "BULLISH" : (d_bearish ? "BEARISH" : "NEUTRAL")
+    color d_col = d_bullish ? color.new(color.lime, 50) : (d_bearish ? color.new(color.red, 50) : color.new(color.gray, 50))
+    table.cell(p_dash, 0, 1, "Daily 200 SMA Bias", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 1, d_str, text_color=color.white, bgcolor=d_col, text_size=size.small)
+
+    // 4H Alignment
+    string h4_str = h4_bullish ? "BULL ALIGNED" : (h4_bearish ? "BEAR ALIGNED" : "MIXED")
+    color h4_col = h4_bullish ? color.new(color.lime, 50) : (h4_bearish ? color.new(color.red, 50) : color.new(color.gray, 50))
+    table.cell(p_dash, 0, 2, "4H EMA Alignment", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 2, h4_str, text_color=color.white, bgcolor=h4_col, text_size=size.small)
+
+    // 1H ADX Status
+    string adx_str = str.tostring(h1_adx, "#.#") + (adx_valid_long ? " (Valid)" : " (Weak)")
+    color adx_col = adx_valid_long ? color.new(color.lime, 50) : color.new(color.gray, 50)
+    table.cell(p_dash, 0, 3, "1H ADX (Momentum)", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 3, adx_str, text_color=color.white, bgcolor=adx_col, text_size=size.small)
+
+    // Vol Filter
+    string vol_str = i_useVol ? (vol_valid ? "OK" : "LOW VOL") : "OFF"
+    color vol_col = (not i_useVol or vol_valid) ? color.new(color.lime, 50) : color.new(color.red, 50)
+    table.cell(p_dash, 0, 4, "Volume Filter", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 4, vol_str, text_color=color.white, bgcolor=vol_col, text_size=size.small)
+
+    // Active Trade State
+    string trd_str = trade_dir == 1 ? "LONG" : (trade_dir == -1 ? "SHORT" : "FLAT")
+    color trd_col = trade_dir == 1 ? color.new(color.lime, 50) : (trade_dir == -1 ? color.new(color.red, 50) : color.new(color.gray, 50))
+    table.cell(p_dash, 0, 5, "Simulated Trade", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 5, trd_str, text_color=color.white, bgcolor=trd_col, text_size=size.small)
+
+    // Current R
+    string r_str = trade_dir != 0 ? str.tostring(current_r, "#.##") + " R" : "-"
+    color r_col = current_r > 0 ? color.new(color.lime, 50) : color.new(color.red, 50)
+    if trade_dir == 0
+        r_col := color.new(color.gray, 50)
+    table.cell(p_dash, 0, 6, "Current R / Max R", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(p_dash, 1, 6, trade_dir != 0 ? (str.tostring(current_r, "#.##") + " / " + str.tostring(max_r, "#.##")) : "-", text_color=color.white, bgcolor=r_col, text_size=size.small)
