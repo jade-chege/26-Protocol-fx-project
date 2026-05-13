@@ -14,7 +14,7 @@ class P4FibonacciBacktester:
         self.funnel = {k: 0 for k in [
             'raw_candles', 'fractals_detected', 'valid_swings',
             'fib_zones_active', 'market_gates_passed', 'pattern_confirmed',
-            'signals_generated', 'trades_executed', 'wins'
+            'signals_generated', 'r_r_skipped', 'trades_executed', 'wins'
         ]}
         self.period = period
         self.interval = interval
@@ -269,29 +269,26 @@ class P4FibonacciBacktester:
 
                             if vol_ratio > 1.5:
                                 stop_method = 'B'
-                                buffer_mult = 2.0
+                                # Method B: Swing Low - 2.0x ATR Buffer
+                                stop_loss = last_swing_low - (2.0 * row['ATR'])
                             else:
                                 stop_method = 'A'
-                                buffer_mult = 1.0
+                                # Method A: 78.6% Retracement Anchor (No extra ATR buffer)
+                                stop_loss = last_swing_high - (swing_dist * 0.786)
 
-                            if stop_method == 'A':
-                                # 78.6% Retracement from Swing High
-                                fib_786 = last_swing_high - (swing_dist * 0.786)
-                                stop_loss = fib_786 - (buffer_mult * row['ATR'])
-                                method_notes = "Method A effective" if stop_loss < last_swing_low else "Method A standard"
-                            else:
-                                stop_loss = last_swing_low - (buffer_mult * row['ATR'])
-                                method_notes = "Method B standard"
+                            # PROTOCOL GATE: 1.5:1 R:R Minimum at Entry
+                            entry_risk = abs(row['Close'] - stop_loss)
+                            entry_reward_t1 = abs(last_swing_high - row['Close'])
 
-                            stop_distance = abs(row['Close'] - stop_loss)
-                            if stop_distance > 3.0 * row['ATR']:
-                                continue  # PROTOCOL GATE: Abort if stop distance > 3x ATR
+                            if entry_risk <= 0 or (entry_reward_t1 / entry_risk) < 1.5:
+                                self.funnel['r_r_skipped'] += 1
+                                continue
 
                             new_trade = {
                                 'direction': 'LONG',
                                 'entry_price': row['Close'],
                                 'stop_loss': stop_loss,
-                                'initial_risk': stop_distance,
+                                'initial_risk': entry_risk,
                                 'tp1': last_swing_high,
                                 'tp2': last_swing_high + (swing_dist * 0.272),
                                 'tp3': last_swing_high + (swing_dist * 0.618),
@@ -306,7 +303,6 @@ class P4FibonacciBacktester:
                                 'highest_high': row['High'],
                                 'volatility_ratio': vol_ratio,
                                 'stop_method': stop_method,
-                                'method_notes': method_notes,
                                 'swing_dist': swing_dist,
                                 'reach_tracker': {'t1': False, 't2': False, 't3': False},
                                 'exit_reason': None,
@@ -346,29 +342,26 @@ class P4FibonacciBacktester:
 
                             if vol_ratio > 1.5:
                                 stop_method = 'B'
-                                buffer_mult = 2.0
+                                # Method B: Swing High + 2.0x ATR Buffer
+                                stop_loss = last_swing_high + (2.0 * row['ATR'])
                             else:
                                 stop_method = 'A'
-                                buffer_mult = 1.0
+                                # Method A: 78.6% Retracement Anchor (No extra ATR buffer)
+                                stop_loss = last_swing_low + (swing_dist * 0.786)
 
-                            if stop_method == 'A':
-                                # 78.6% Retracement from Swing Low
-                                fib_786 = last_swing_low + (swing_dist * 0.786)
-                                stop_loss = fib_786 + (buffer_mult * row['ATR'])
-                                method_notes = "Method A effective" if stop_loss > last_swing_high else "Method A standard"
-                            else:
-                                stop_loss = last_swing_high + (buffer_mult * row['ATR'])
-                                method_notes = "Method B standard"
+                            # PROTOCOL GATE: 1.5:1 R:R Minimum at Entry
+                            entry_risk = abs(row['Close'] - stop_loss)
+                            entry_reward_t1 = abs(row['Close'] - last_swing_low)
 
-                            stop_distance = abs(row['Close'] - stop_loss)
-                            if stop_distance > 3.0 * row['ATR']:
-                                continue  # PROTOCOL GATE: Abort if stop distance > 3x ATR
+                            if entry_risk <= 0 or (entry_reward_t1 / entry_risk) < 1.5:
+                                self.funnel['r_r_skipped'] += 1
+                                continue
 
                             new_trade = {
                                 'direction': 'SHORT',
                                 'entry_price': row['Close'],
                                 'stop_loss': stop_loss,
-                                'initial_risk': stop_distance,
+                                'initial_risk': entry_risk,
                                 'tp1': last_swing_low,
                                 'tp2': last_swing_low - (swing_dist * 0.272),
                                 'tp3': last_swing_low - (swing_dist * 0.618),
@@ -383,7 +376,6 @@ class P4FibonacciBacktester:
                                 'lowest_low': row['Low'],
                                 'volatility_ratio': vol_ratio,
                                 'stop_method': stop_method,
-                                'method_notes': method_notes,
                                 'swing_dist': swing_dist,
                                 'reach_tracker': {'t1': False, 't2': False, 't3': False},
                                 'exit_reason': None,
@@ -594,6 +586,14 @@ class P4FibonacciBacktester:
             {'Metric': 'Avg TP1 Reward / Risk', 'Value': f"{avg_tp1_r:.2f}R"}
         ]
         print(pd.DataFrame(geom_data).to_markdown(index=False))
+
+        # Gate Efficiency
+        total_signals = self.funnel['signals_generated']
+        r_r_skips = self.funnel['r_r_skipped']
+        print("\n--- Gate Efficiency & R/R Filter ---")
+        print(f"Signals Generated: {total_signals}")
+        print(f"Skipped (R/R < 1.5): {r_r_skips} ({(r_r_skips/max(1,total_signals))*100:.1f}%)")
+        print(f"Executed: {self.funnel['trades_executed']}")
         print("=========================\n")
 
 if __name__ == '__main__':
