@@ -587,24 +587,118 @@ class P4FibonacciBacktester:
         ]
         print(pd.DataFrame(geom_data).to_markdown(index=False))
 
-        # Gate Efficiency
-        total_signals = self.funnel['signals_generated']
-        r_r_skips = self.funnel['r_r_skipped']
-        print("\n--- Gate Efficiency & R/R Filter ---")
-        print(f"Signals Generated: {total_signals}")
-        print(f"Skipped (R/R < 1.5): {r_r_skips} ({(r_r_skips/max(1,total_signals))*100:.1f}%)")
-        print(f"Executed: {self.funnel['trades_executed']}")
-        print("=========================\n")
+        # PHASE B.0: FAILURE ANALYSIS
+        print("\n--- Phase B.0: Failure Analysis ---")
 
+        # 1. Avg Entry Retracement Depth %
+        depths = []
+        for t in self.trades:
+            # Safe division using max() to prevent ZeroDivisionError
+            safe_dist = max(t['swing_dist'], 1e-9)
+            depth_from_top = abs(t['tp1'] - t['entry_price']) / safe_dist
+            depths.append(depth_from_top)
+
+        avg_depth = sum(depths) / len(depths) if depths else 0
+        print(f"Avg Entry Retracement Depth (from Swing Extreme): {avg_depth:.1%}")
+
+        # 2. Stop Hit Velocity (Bars Held for Losers)
+        losers = [t for t in self.trades if t['pnl_r'] < 0]
+        if losers:
+            stop_bars = [t['bars_held'] for t in losers]
+            immediate_stops = sum(1 for b in stop_bars if b < 5)
+            print(f"Avg Bars Held (Stopped Trades): {sum(stop_bars)/len(stop_bars):.1f}")
+            print(f"Immediate Stops (< 5 Bars): {immediate_stops}/{len(losers)} ({immediate_stops/len(losers)*100:.0f}%)")
+        else:
+            print("No stopped trades to analyze.")
+
+        # 3. Method Usage
+        method_a = sum(1 for t in self.trades if t.get('stop_method') == 'A')
+        method_b = sum(1 for t in self.trades if t.get('stop_method') == 'B')
+        print(f"Method A Usage: {method_a} ({method_a/n*100:.0f}%)")
+        print(f"Method B Usage: {method_b} ({method_b/n*100:.0f}%)")
+
+        print("=========================\n")
 if __name__ == '__main__':
-    testers = ['GBPUSD=X']
-    results = []
-    for t in testers:
-        p4 = P4FibonacciBacktester(ticker=t)
-        results.append(p4.run())
+    # EXPAND UNIVERSE TO CORE ASSETS
+    # Forex Majors + Gold + Nasdaq to aggregate sample size
+    tickers = ['GBPUSD=X', 'EURUSD=X', 'GC=F', 'NQ=F']
+
+    all_results = []
+    all_trades = []
+    aggregate_funnel = {
+        'signals_generated': 0, 'r_r_skipped': 0, 'trades_executed': 0, 'wins': 0
+    }
+
+    print("="*60)
+    print("PHASE B.0: FAILURE ANALYSIS")
+    print("="*60)
+
+    for ticker in tickers:
+        print(f"\n>>> PROCESSING: {ticker} <<<")
+        p4 = P4FibonacciBacktester(ticker=ticker)
+        res = p4.run()
+
+        # Collect individual stats
+        all_results.append(res)
+
+        # Collect individual trades for combined analysis
+        all_trades.extend(p4.trades)
+
+        # Aggregate Funnel with Safe Key Handling
+        for key in aggregate_funnel:
+            if key in p4.funnel:
+                aggregate_funnel[key] += p4.funnel[key]
+
+        # Print individual diagnostics
         p4.print_diagnostics()
 
-    df = pd.DataFrame(results)
-    df['Funnel'] = df['Funnel'].apply(lambda x: str(x))
-    print("\n--- RESULTS ---")
-    print(df[['Ticker', 'N', 'WR', 'Avg_R', 'PF', 'CI_LB', 'Status', 'Funnel']].to_markdown(index=False))
+    # --- AGGREGATE PERFORMANCE ANALYSIS ---
+    print("\n" + "="*60)
+    print("AGGREGATED RESULTS (ALL INSTRUMENTS)")
+    print("="*60)
+
+    if not all_trades:
+        print("NO TRADES EXECUTED ACROSS ALL INSTRUMENTS.")
+    else:
+        n = len(all_trades)
+        wins = sum(1 for t in all_trades if t['pnl_r'] > 0)
+        total_r = sum(t['pnl_r'] for t in all_trades)
+        avg_r = total_r / n
+
+        wr = wins / n
+        gross_profit = sum(t['pnl_r'] for t in all_trades if t['pnl_r'] > 0)
+        gross_loss = abs(sum(t['pnl_r'] for t in all_trades if t['pnl_r'] < 0))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+        # Wilson CI Calculation for Aggregate
+        z = norm.ppf(1 - (1 - 0.95) / 2)
+        denominator = 1 + z**2 / n
+        centre_adjusted_probability = wr + z**2 / (2 * n)
+        adjusted_standard_deviation = np.sqrt((wr * (1 - wr) + z**2 / (4 * n)) / n)
+        ci_lb = (centre_adjusted_probability - z * adjusted_standard_deviation) / denominator
+
+        gates = (n >= 40) and (ci_lb >= 0.48) and (pf >= 1.2) and (avg_r >= 0.4)
+
+        print(f"Combined N: {n}")
+        print(f"Win Rate: {wr*100:.1f}%")
+        print(f"Avg R: {avg_r:.3f}")
+        print(f"Profit Factor: {pf:.2f}")
+        print(f"Wilson CI LB: {ci_lb:.3f}")
+        print(f"STATUS: {'PASS' if gates else 'FAIL'}")
+
+        sigs = aggregate_funnel.get('signals_generated', 1)
+        skips = aggregate_funnel.get('r_r_skipped', 0)
+        print(f"Signals Skipped by R/R Gate: {skips} ({(skips/max(1,sigs))*100:.1f}%)")
+        print(f"Executed: {aggregate_funnel['trades_executed']}")
+
+        print("\n--- PER-INSTRUMENT BREAKDOWN ---")
+        df_summary = pd.DataFrame(all_results)
+        if 'Funnel' in df_summary.columns:
+            display_cols = ['Ticker', 'N', 'WR', 'Avg_R', 'PF', 'CI_LB', 'Status']
+            print(df_summary[display_cols].to_markdown(index=False))
+        else:
+            print(df_summary.to_markdown(index=False))
+
+    print("\n" + "="*60)
+    print("EXECUTION COMPLETE")
+    print("="*60)

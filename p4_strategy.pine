@@ -1,0 +1,77 @@
+//@version=6
+strategy("P4 Fibonacci - Bare Minimum Edge", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=2)
+
+// =========================================================================
+// RULE 1: SWING DETECTION (Williams 5-Bar Fractal)
+// =========================================================================
+atr = ta.atr(14)
+
+isFractalHigh = high[2] > high[0] and high[2] > high[1] and high[2] > high[3] and high[2] > high[4]
+isFractalLow  = low[2] < low[0]  and low[2] < low[1]  and low[2] < low[3]  and low[2] < low[4]
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if isFractalHigh
+    lastSwingHigh := high[2]
+
+if isFractalLow
+    lastSwingLow := low[2]
+
+swingDist = math.abs(lastSwingHigh - lastSwingLow)
+isValidSwing = swingDist >= 1.5 * atr
+
+// Plot Swing Points for Visual Confirmation
+plot(lastSwingHigh, color=color.new(color.green, 50), style=plot.style_circles, linewidth=2, title="Swing High")
+plot(lastSwingLow, color=color.new(color.red, 50), style=plot.style_circles, linewidth=2, title="Swing Low")
+
+// =========================================================================
+// RULE 2: THE GOLDEN/OTE ZONE (38.2% - 61.8%)
+// =========================================================================
+// LONG ZONE
+longFib382 = lastSwingHigh - (swingDist * 0.382)
+longFib618 = lastSwingHigh - (swingDist * 0.618)
+inLongZone = close <= longFib382 and close >= longFib618
+
+// SHORT ZONE
+shortFib382 = lastSwingLow + (swingDist * 0.382)
+shortFib618 = lastSwingLow + (swingDist * 0.618)
+inShortZone = close >= shortFib382 and close <= shortFib618
+
+// =========================================================================
+// RULE 3: ENTRY TRIGGER (Tier 1 Pattern ONLY)
+// =========================================================================
+bullishEngulfing = close[1] < open[1] and close > open and close > open[1] and open < close[1]
+bearishEngulfing = close[1] > open[1] and close < open and close < open[1] and open > close[1]
+
+doji1 = math.abs(close[1] - open[1]) < (high[1] - low[1]) * 0.3
+morningStar = close[2] < open[2] and doji1 and close > open and close > (open[2] + close[2]) / 2
+eveningStar = close[2] > open[2] and doji1 and close < open and close < (open[2] + close[2]) / 2
+
+longTrigger  = inLongZone and isValidSwing and (bullishEngulfing or morningStar)
+shortTrigger = inShortZone and isValidSwing and (bearishEngulfing or eveningStar)
+
+// =========================================================================
+// RULE 4 & 5: STOP LOSS & TARGET EXECUTION
+// =========================================================================
+var float longSL = na
+var float longTP = na
+var float shortSL = na
+var float shortTP = na
+
+if longTrigger and strategy.position_size == 0
+    longSL := close - (1.5 * atr)
+    longTP := lastSwingHigh
+    strategy.entry("Long", strategy.long)
+
+if shortTrigger and strategy.position_size == 0
+    shortSL := close + (1.5 * atr)
+    shortTP := lastSwingLow
+    strategy.entry("Short", strategy.short)
+
+// Exit Management
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Long", stop=longSL, limit=longTP)
+
+if strategy.position_size < 0
+    strategy.exit("Exit Short", "Short", stop=shortSL, limit=shortTP)
